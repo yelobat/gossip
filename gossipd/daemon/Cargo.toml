@@ -1,0 +1,33 @@
+[package]
+name = "gossipd"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gossipd-core = { path = "../core" }
+serde.workspace = true
+serde_json.workspace = true
+rusqlite = { version = "0.39", features = ["bundled"] }
+getrandom = "0.3"
+ed25519-dalek.workspace = true
+postcard.workspace = true
+data-encoding.workspace = true
+iroh = "1.0.3"
+iroh-mainline-address-lookup = "0.5"
+iroh-mdns-address-lookup = "0.5"
+iroh-blobs = { version = "0.103", features = ["fs-store"] }
+futures-lite = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+arti-client = { version = "0.45", default-features = false, features = ["tokio", "rustls", "onion-service-client", "onion-service-service"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+futures = "0.3"
+tor-hsservice = "0.45"
+tor-cell = "0.45"
+tor-rtcompat = "0.45"
+safelog = "0.9.1"
+
+[dev-dependencies]
+serde_json.workspace = true
+gossipd-core = { path = "../core" }

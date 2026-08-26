@@ -1,0 +1,25 @@
+;;; e2e-tor-vpn-dave.el --- tor transport bootstrap, tor-path delivery, dial-back probe  -*- lexical-binding: t -*-
+(load (expand-file-name "tests/harness.el" default-directory))
+(setq gossip-enable-tor t
+      gossip-advertised-addresses '("203.0.113.7:41641"))
+(gossip-daemon-start)
+(gossip-test-pump 2.5)
+(let ((check (jsonrpc-request gossip--connection 'net/check nil)))
+  (gossip-test-assert (eq (plist-get check :inbound-direct) :json-false)
+                      "dial-back probe should report dial-out-only, got %S" check))
+(gossip-send "gsp1-dave-c4a2" "dave, are you on the onion?")
+(gossip-test-pump 4.0)
+(gossip-test-assert (gossip-test-find 'delivered
+                                      (lambda (p) (equal (plist-get p :path) "tor")))
+                    "no tor-path delivery to dave")
+(gossip-test-assert (gossip-test-find 'received
+                                      (lambda (p) (equal (plist-get p :from-name) "dave")))
+                    "no reply from dave")
+(let ((status (jsonrpc-request gossip--connection 'status nil)))
+  (gossip-test-assert (string-suffix-p ".onion" (plist-get status :tor))
+                      "status should report our onion address, got %S" (plist-get status :tor))
+  (gossip-test-assert (equal (append (plist-get status :advertised-addrs) nil)
+                             '("203.0.113.7:41641"))
+                      "advertised addrs missing from status"))
+(message "PASS e2e-tor-vpn-dave")
+(gossip-daemon-stop)
