@@ -296,7 +296,7 @@
   (let* ((kind (or (plist-get msg :kind) "chat"))
          (handler (gethash kind gossip--kind-handlers)))
     (cond
-     ((equal kind "chat")
+     ((member kind '("chat" "file"))
       (gossip--chat-render-incoming msg))
      (handler (funcall handler msg))
      (t (message "gossip: message of unregistered kind %S from %s"
@@ -329,14 +329,14 @@
         (puthash peer-id buffer gossip--chat-buffers)
         buffer)))
 
-(defun gossip--chat-append (buffer sender body face)
+(defun gossip--chat-append (buffer sender body face &optional ts)
   "Append a chat line from SENDER with BODY to BUFFER using FACE."
   (with-current-buffer buffer
     (let ((inhibit-read-only t)
           (at-end (eobp)))
       (save-excursion
         (goto-char (point-max))
-        (insert (format-time-string "[%H:%M] ")
+        (insert (format-time-string "[%H:%M] " ts)
                 (propertize (format "%s: " sender) 'face face)
                 body "\n"))
       (when at-end (goto-char (point-max))))))
@@ -358,8 +358,8 @@
   (let* ((peer-id (plist-get msg :from))
          (peer-name (or (plist-get msg :from-name) peer-id))
          (buffer (gossip--chat-buffer peer-id peer-name)))
-    (gossip--chat-append buffer peer-name (plist-get msg :body)
-                         'gossip-peer-face)
+    (gossip--chat-append buffer peer-name (gossip--chat-body msg)
+                         'gossip-peer-face (plist-get msg :ts))
     (unless (get-buffer-window buffer)
       (message "gossip: %s: %s" peer-name (plist-get msg :body)))))
 
@@ -401,9 +401,16 @@
                    (current-buffer)
                    (if mine "you" (or (plist-get msg :from-name)
                                       gossip--chat-peer-name))
-                   (plist-get msg :body)
-                   (if mine 'gossip-self-face 'gossip-peer-face))))
+                   (gossip--chat-body msg)
+                   (if mine 'gossip-self-face 'gossip-peer-face)
+                   (plist-get msg :ts))))
               history))))
+
+(defun gossip--chat-body (msg)
+  "Return the display text for chat MSG, labelling file transfers."
+  (if (equal (plist-get msg :kind) "file")
+      (format "[file] %s" (plist-get msg :body))
+    (plist-get msg :body)))
 
 (defun gossip-chat-send (text)
   "Prompt for TEXT and send it to the current chat buffer's peer."
@@ -440,6 +447,12 @@
     (gossip--request 'blob/send
                      (list :to (plist-get contact :id)
                            :path (expand-file-name file)))
+    (when-let* ((buffer (gethash (plist-get contact :id) gossip--chat-buffers)))
+      (when (buffer-live-p buffer)
+        (gossip--chat-append
+         buffer "you"
+         (format "[file] %s" (file-name-nondirectory file))
+         'gossip-self-face)))
     (message "gossip: transferring %s to %s"
              (file-name-nondirectory file) (plist-get contact :name))))
 

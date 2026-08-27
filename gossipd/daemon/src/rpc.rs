@@ -366,6 +366,25 @@ impl Daemon {
             "t{:04}",
             (crate::state::jitter_roll().abs() * 9999.0) as u32
         );
+        let name = path
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| to.to_string());
+        {
+            let store = s.shared.store.lock().unwrap();
+            let seq = store.frontier(&s.shared.my_master, &contact.master_pub) + 1;
+            let entry = LogEntry::sign(
+                &s.keys.master,
+                contact.master_pub,
+                seq,
+                "file",
+                &name,
+                now_ts(),
+            );
+            store.append(&entry);
+            store.enqueue(&contact.master_pub, seq);
+        }
+        ensure_peer(&s.shared, &contact.id).send(PeerCmd::Push).ok();
         tokio::spawn(crate::blob::send(
             s.shared.clone(),
             contact,

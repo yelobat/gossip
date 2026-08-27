@@ -274,6 +274,14 @@ fn two_daemons_deliver_queue_and_converge() {
     let received_file = dir_b.join("downloads").join("photo.bin");
     assert_eq!(std::fs::read(received_file).unwrap(), payload);
 
+    let file_entry = b.wait_notification(Duration::from_secs(20), |m, p| {
+        m == "msg/received" && p["kind"] == json!("file")
+    });
+    assert_eq!(file_entry["body"].as_str().unwrap(), "photo.bin");
+    assert!(file_entry["ts"].as_f64().unwrap() > 0.0);
+    assert!(history_bodies(&mut a, &b_id).contains(&"photo.bin".to_string()));
+    assert!(history_bodies(&mut b, &a_id).contains(&"photo.bin".to_string()));
+
     a.shutdown();
     b.shutdown();
     let _ = std::fs::remove_dir_all(&base);
