@@ -542,3 +542,4 @@
     ("f" "send file" gossip-send-file)]])
 
 (provide 'gossip)
+;;; gossip.el ends here
