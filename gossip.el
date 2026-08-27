@@ -211,9 +211,8 @@
   "Return (and show) an invite ticket for this node."
   (interactive)
   (let ((ticket (plist-get (gossip--request 'contact/makeTicket) :ticket)))
-    (when (called-interactively-p 'any)
-      (kill-new ticket)
-      (message "gossip: ticket copied to kill ring: %s" ticket))
+    (kill-new ticket)
+    (message "gossip: ticket copied to kill ring: %s" ticket)
     ticket))
 
 (defun gossip-add-contact (ticket &optional name)
