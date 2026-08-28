@@ -60,6 +60,13 @@ impl Store {
         Ok(Self { conn })
     }
 
+    pub fn snapshot(&self, path: &Path) -> rusqlite::Result<()> {
+        let _ = std::fs::remove_file(path);
+        self.conn
+            .execute("VACUUM INTO ?1", [path.to_string_lossy()])?;
+        Ok(())
+    }
+
     pub fn meta_get(&self, key: &str) -> Option<String> {
         self.conn
             .query_row("SELECT value FROM meta WHERE key=?1", [key], |r| r.get(0))

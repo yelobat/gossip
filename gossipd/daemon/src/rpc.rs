@@ -114,6 +114,8 @@ impl Daemon {
             "config/setFilePolicy" => self.set_file_policy(params),
             "config/setContactFilePolicy" => self.set_contact_file_policy(params),
             "file/respond" => self.file_respond(params),
+            "profile/export" => self.profile_export(params),
+            "profile/import" => self.profile_import(params),
             "net/check" => self.net_check(),
             "status" => Ok(self.status()),
             "shutdown" => {
@@ -498,6 +500,69 @@ impl Daemon {
         Ok(json!({"transfer-id": transfer_id}))
     }
 
+    fn profile_export(&self, params: Value) -> Result<Value, (i64, String)> {
+        let s = self.session()?;
+        let path = params["path"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .ok_or((-32602, "profile/export needs path".to_string()))?;
+        let path = std::path::PathBuf::from(shellexpand_home(path));
+        let tmp = s.shared.data_dir.join(".export-snapshot.db");
+        s.shared
+            .store
+            .lock()
+            .unwrap()
+            .snapshot(&tmp)
+            .map_err(|e| (-32603, format!("database snapshot failed: {e}")))?;
+        let read = |name: &str| std::fs::read(s.shared.data_dir.join(name));
+        let db = std::fs::read(&tmp).map_err(|e| (-32603, e.to_string()));
+        std::fs::remove_file(&tmp).ok();
+        let archive = gossipd_core::profile::ProfileArchive {
+            version: gossipd_core::profile::VERSION,
+            identity: read("identity.key").map_err(|e| (-32603, e.to_string()))?,
+            iroh: read("iroh.key").map_err(|e| (-32603, e.to_string()))?,
+            tor: read("tor.key").map_err(|e| (-32603, e.to_string()))?,
+            db: db.map_err(|e| (-32603, e.1))?,
+        };
+        std::fs::write(&path, archive.encode())
+            .map_err(|e| (-32603, format!("cannot write {}: {e}", path.display())))?;
+        Ok(json!({"path": path.to_string_lossy(), "node-id": self.node_id()}))
+    }
+
+    fn profile_import(&self, params: Value) -> Result<Value, (i64, String)> {
+        let path = params["path"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .ok_or((-32602, "profile/import needs path".to_string()))?;
+        let data_dir = params["data-dir"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .ok_or((-32602, "profile/import needs data-dir".to_string()))?;
+        let dir = std::path::PathBuf::from(shellexpand_home(data_dir));
+        if let Some(s) = &self.session {
+            if s.shared.data_dir == dir {
+                return Err((-32002, "cannot import over the running profile; import into \
+                                     a fresh data-dir and start a daemon there"
+                    .into()));
+            }
+        }
+        if dir.join("identity.key").exists() && !params["overwrite"].as_bool().unwrap_or(false) {
+            return Err((
+                -32602,
+                format!("{} already has a profile (pass overwrite to replace)", dir.display()),
+            ));
+        }
+        let bytes = std::fs::read(shellexpand_home(path))
+            .map_err(|e| (-32603, format!("cannot read {path}: {e}")))?;
+        let archive = gossipd_core::profile::ProfileArchive::decode(&bytes).map_err(|e| (-32602, e))?;
+        archive
+            .unpack_into_dir(&dir)
+            .map_err(|e| (-32603, format!("cannot write profile: {e}")))?;
+        let node = node_id_of(&archive.identity)
+            .ok_or((-32602, "archive has an invalid identity key".to_string()))?;
+        Ok(json!({"data-dir": dir.to_string_lossy(), "node-id": node}))
+    }
+
     fn net_check(&self) -> Result<Value, (i64, String)> {
         let s = self.session()?;
         let inbound = *s.shared.inbound_seen.lock().unwrap();
@@ -606,6 +671,12 @@ fn file_policy_json(store: &Store) -> Value {
         .meta_get("files_default")
         .unwrap_or_else(|| "accept".into());
     json!({ "default": default })
+}
+
+fn node_id_of(identity: &[u8]) -> Option<String> {
+    let bytes: [u8; 32] = identity.try_into().ok()?;
+    let master = gossipd_core::identity::MasterKey::from_bytes(&bytes);
+    Some(node_id(&master.public()))
 }
 
 fn shellexpand_home(path: &str) -> String {

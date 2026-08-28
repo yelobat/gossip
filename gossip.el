@@ -560,6 +560,26 @@ terminal or Bevy client can attach to the same identity."
                    (list :id (plist-get contact :id) :policy policy))
   (message "gossip: files from %s: %s" (plist-get contact :name) policy))
 
+;;;###autoload
+(defun gossip-export-profile (file)
+  "Export this profile (identity, contacts, chat history) to FILE."
+  (interactive "FExport profile to file: ")
+  (message "gossip: exported profile to %s"
+           (plist-get (gossip--request 'profile/export
+                                       (list :path (expand-file-name file)))
+                      :path)))
+
+;;;###autoload
+(defun gossip-import-profile (file dir)
+  "Import a profile archive FILE into data directory DIR.
+DIR must differ from the running profile."
+  (interactive "fProfile archive: \nDImport into data directory: ")
+  (let ((res (gossip--request 'profile/import
+                              (list :path (expand-file-name file)
+                                    :data-dir (expand-file-name dir)))))
+    (message "gossip: imported %s into %s - set gossip-data-directory there and restart"
+             (plist-get res :node-id) (plist-get res :data-dir))))
+
 (defun gossip-show-node-id ()
   "Show and copy this node's id."
   (interactive)
