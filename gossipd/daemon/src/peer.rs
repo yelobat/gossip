@@ -130,9 +130,10 @@ async fn run(shared: Arc<Shared>, contact_id: String, mut rx: mpsc::UnboundedRec
                     "peer/presence",
                     json!({"peer-id": contact_id, "online": false}),
                 );
-                attempts = 0;
                 if has_queue(&shared, &contact_id) {
-                    next_dial = Some(Instant::now());
+                    backoff_or_give_up(&shared, &contact_id, &mut attempts, &mut next_dial);
+                } else {
+                    attempts = 0;
                 }
             }
             Ev::DialTick => {
@@ -149,7 +150,6 @@ async fn run(shared: Arc<Shared>, contact_id: String, mut rx: mpsc::UnboundedRec
                 match result {
                     Some(DialOutcome::Direct(conn)) => {
                         adopt(&shared, &contact_id, &mut link, conn, true);
-                        attempts = 0;
                     }
 
                     Some(DialOutcome::Tor) => {
@@ -161,35 +161,67 @@ async fn run(shared: Arc<Shared>, contact_id: String, mut rx: mpsc::UnboundedRec
                     }
                     None if link.is_some() => {}
                     None => {
-                        let queued = queued_rows(&shared, &contact_id);
-                        if !queued.1.is_empty() {
-                            let delay = shared.backoff.delay_seconds(attempts, jitter_roll());
-                            attempts += 1;
-                            let (name, master) = queued.0;
-                            {
-                                let store = shared.store.lock().unwrap();
-                                store.queue_set_attempt(&master, attempts, now_ts() + delay);
-                            }
-                            for seq in queued.1 {
-                                shared.notifier.notify(
-                                    "queue/update",
-                                    json!({
-                                        "msg-id": msg_id(seq),
-                                        "to": contact_id,
-                                        "to-name": name,
-                                        "attempts": attempts,
-                                        "delay-seconds": (delay * 100.0).round() / 100.0,
-                                    }),
-                                );
-                            }
-                            tracing::debug!(peer = %contact_id, attempts, delay, "dial failed, backing off");
-                            next_dial = Some(Instant::now() + Duration::from_secs_f64(delay));
-                        }
+                        backoff_or_give_up(&shared, &contact_id, &mut attempts, &mut next_dial)
                     }
                 }
             }
         }
     }
+}
+
+fn backoff_or_give_up(
+    shared: &Arc<Shared>,
+    contact_id: &str,
+    attempts: &mut u32,
+    next_dial: &mut Option<Instant>,
+) {
+    let queued = queued_rows(shared, contact_id);
+    if queued.1.is_empty() {
+        return;
+    }
+    let delay = shared.backoff.delay_seconds(*attempts, jitter_roll());
+    *attempts += 1;
+    let (name, master) = queued.0;
+    shared
+        .store
+        .lock()
+        .unwrap()
+        .queue_set_attempt(&master, *attempts, now_ts() + delay);
+    if shared.backoff.gave_up(*attempts) {
+        give_up(shared, contact_id, *attempts);
+        return;
+    }
+    for seq in queued.1 {
+        shared.notifier.notify(
+            "queue/update",
+            json!({
+                "msg-id": msg_id(seq),
+                "to": contact_id,
+                "to-name": name,
+                "attempts": *attempts,
+                "delay-seconds": (delay * 100.0).round() / 100.0,
+            }),
+        );
+    }
+    tracing::debug!(peer = %contact_id, attempts = *attempts, delay, "delivery failed, backing off");
+    *next_dial = Some(Instant::now() + Duration::from_secs_f64(delay));
+}
+
+fn give_up(shared: &Arc<Shared>, contact_id: &str, attempts: u32) {
+    let name = peer_info(shared, contact_id)
+        .map(|p| p.name)
+        .unwrap_or_else(|| contact_id.to_string());
+    tracing::info!(peer = %contact_id, attempts, "pausing redial after too many attempts");
+    shared.notifier.notify(
+        "log",
+        json!({
+            "level": "warn",
+            "message": format!(
+                "paused delivery to {name} after {attempts} attempts; \
+                 will resume if they reconnect or you re-add their ticket"
+            ),
+        }),
+    );
 }
 
 fn peer_info(shared: &Arc<Shared>, contact_id: &str) -> Option<PeerInfo> {

@@ -62,6 +62,10 @@
   "Random jitter applied to each redial delay."
   :type 'number)
 
+(defcustom gossip-dial-backoff-max-attempts 12
+  "Stop actively redialing a peer after this many failed attempts."
+  :type 'natnum)
+
 (defcustom gossip-allow-relays nil
   "If non-nil, permit relayed transport as a fallback."
   :type 'boolean)
@@ -213,7 +217,8 @@ terminal or Bevy client can attach to the same identity."
                         :backoff (list :initial-seconds gossip-dial-backoff-initial
                                        :max-seconds gossip-dial-backoff-max
                                        :multiplier gossip-dial-backoff-multiplier
-                                       :jitter gossip-dial-backoff-jitter)))))
+                                       :jitter gossip-dial-backoff-jitter
+                                       :max-attempts gossip-dial-backoff-max-attempts)))))
       (setq gossip--node-id (plist-get reply :node-id))
       (message "gossip: up as %s" gossip--node-id))))
 

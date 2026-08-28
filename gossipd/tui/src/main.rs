@@ -98,6 +98,7 @@ struct Args {
     daemon_cmd: Vec<String>,
     name: String,
     import: Option<String>,
+    max_attempts: Option<u32>,
 }
 
 fn resolve_args() -> Args {
@@ -106,16 +107,18 @@ fn resolve_args() -> Args {
     let mut daemon = env_or("GOSSIPD", "gossipd");
     let mut name = std::env::var("GOSSIP_NAME").unwrap_or_default();
     let mut import = None;
+    let mut max_attempts = std::env::var("GOSSIP_MAX_ATTEMPTS").ok().and_then(|v| v.parse().ok());
     while let Some(a) = args.next() {
         match a.as_str() {
             "--data-dir" => data_dir = args.next().unwrap_or(data_dir),
             "--daemon" => daemon = args.next().unwrap_or(daemon),
             "--name" => name = args.next().unwrap_or(name),
             "--import" => import = args.next(),
+            "--max-attempts" => max_attempts = args.next().and_then(|v| v.parse().ok()),
             _ => {}
         }
     }
-    Args { data_dir, daemon_cmd: vec![daemon], name, import }
+    Args { data_dir, daemon_cmd: vec![daemon], name, import, max_attempts }
 }
 
 const HELP: &str = "\
@@ -138,7 +141,7 @@ commands:
   <text>             send a chat message to current contact";
 
 fn main() {
-    let Args { data_dir, daemon_cmd, name, import } = resolve_args();
+    let Args { data_dir, daemon_cmd, name, import, max_attempts } = resolve_args();
 
     if let Some(archive) = import {
         if std::path::Path::new(&format!("{data_dir}/identity.key")).exists() {
@@ -163,11 +166,12 @@ fn main() {
         }
     };
 
+    let mut init_params = json!({"data-dir": data_dir, "display-name": name});
+    if let Some(n) = max_attempts {
+        init_params["backoff"] = json!({"max-attempts": n});
+    }
     let init = client
-        .request(
-            "init",
-            json!({"data-dir": data_dir, "display-name": name}),
-        )
+        .request("init", init_params)
         .unwrap_or_else(|e| fatal(&e));
     let node_id = init["node-id"].as_str().unwrap_or("?").to_string();
     println!("gossip: up as {node_id}");

@@ -7,6 +7,7 @@ pub struct BackoffCfg {
     pub max_seconds: f64,
     pub multiplier: f64,
     pub jitter: f64,
+    pub max_attempts: u32,
 }
 
 impl Default for BackoffCfg {
@@ -16,6 +17,7 @@ impl Default for BackoffCfg {
             max_seconds: 300.0,
             multiplier: 2.0,
             jitter: 0.2,
+            max_attempts: 12,
         }
     }
 }
@@ -25,6 +27,10 @@ impl BackoffCfg {
         let base =
             (self.initial_seconds * self.multiplier.powi(attempts as i32)).min(self.max_seconds);
         (base * (1.0 + jitter_roll * self.jitter)).max(0.0)
+    }
+
+    pub fn gave_up(&self, attempts: u32) -> bool {
+        self.max_attempts > 0 && attempts >= self.max_attempts
     }
 }
 
@@ -46,5 +52,15 @@ mod tests {
         let cfg = BackoffCfg::default();
         assert_eq!(cfg.delay_seconds(0, 1.0), 1.2);
         assert_eq!(cfg.delay_seconds(0, -1.0), 0.8);
+    }
+
+    #[test]
+    fn gives_up_at_cap_and_never_when_zero() {
+        let cfg = BackoffCfg { max_attempts: 3, ..Default::default() };
+        assert!(!cfg.gave_up(2));
+        assert!(cfg.gave_up(3));
+        assert!(cfg.gave_up(9));
+        let forever = BackoffCfg { max_attempts: 0, ..Default::default() };
+        assert!(!forever.gave_up(1_000_000));
     }
 }
