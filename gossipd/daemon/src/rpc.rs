@@ -67,17 +67,17 @@ impl Daemon {
             .ok_or((-32002, "daemon not initialized, call init first".into()))
     }
 
-    pub async fn handle(&mut self, request: Value) {
+    pub async fn handle(&mut self, request: Value, origin: &crate::ClientHandle) {
         let method = request["method"].as_str().unwrap_or("").to_string();
         let id = request["id"].clone();
         let params = request["params"].clone();
-        let result = self.dispatch(&method, params, &id).await;
+        let result = self.dispatch(&method, params, &id, origin).await;
         if id.is_null() {
             return;
         }
         match result {
-            Ok(result) => self.notifier.respond(&id, result),
-            Err((code, message)) => self.notifier.respond_error(&id, code, message),
+            Ok(result) => origin.respond(&id, result),
+            Err((code, message)) => origin.respond_error(&id, code, message),
         }
     }
 
@@ -86,6 +86,7 @@ impl Daemon {
         method: &str,
         params: Value,
         id: &Value,
+        origin: &crate::ClientHandle,
     ) -> Result<Value, (i64, String)> {
         match method {
             "init" => self.init(params).await,
@@ -109,11 +110,16 @@ impl Daemon {
             "msg/send" => self.msg_send(params),
             "msg/history" => self.msg_history(params),
             "blob/send" => self.blob_send(params),
+            "config/setDownloadsDir" => self.set_downloads_dir(params),
+            "config/setFilePolicy" => self.set_file_policy(params),
+            "config/setContactFilePolicy" => self.set_contact_file_policy(params),
+            "file/respond" => self.file_respond(params),
             "net/check" => self.net_check(),
             "status" => Ok(self.status()),
             "shutdown" => {
-                self.notifier.respond(id, json!({"ok": true}));
+                origin.respond(id, json!({"ok": true}));
                 tracing::info!("shutdown");
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                 std::process::exit(0);
             }
             _ => Err((-32601, format!("unknown method {method}"))),
@@ -163,6 +169,17 @@ impl Daemon {
             }
         }
 
+        let downloads_dir = match params["downloads-dir"].as_str().filter(|s| !s.is_empty()) {
+            Some(path) => {
+                store.meta_set("downloads_dir", path);
+                std::path::PathBuf::from(path)
+            }
+            None => store
+                .meta_get("downloads_dir")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| data_dir.join("downloads")),
+        };
+
         let (endpoint, mdns) = net::build_endpoint(&keys.iroh_secret, &self.transport)
             .await
             .map_err(|e| (-32603, e))?;
@@ -190,11 +207,13 @@ impl Daemon {
             blobs,
             blobs_proto,
             data_dir: data_dir.clone(),
+            downloads_dir: Mutex::new(downloads_dir),
             backoff: self.backoff.clone(),
             my_master: keys.master.public().to_bytes(),
             peers: Mutex::new(Default::default()),
             conns: Mutex::new(Default::default()),
             inbound_seen: Mutex::new(false),
+            pending_files: Mutex::new(Default::default()),
             tor: Mutex::new(None),
         });
         net::spawn_accept_loop(shared.clone());
@@ -314,10 +333,89 @@ impl Daemon {
             (entry, s.shared.is_connected(&contact.id))
         };
         ensure_peer(&s.shared, &contact.id).send(PeerCmd::Push).ok();
+        self.notifier.notify(
+            "msg/sent",
+            json!({
+                "id": msg_id(entry.seq),
+                "to": contact.id,
+                "to-name": contact.name,
+                "kind": kind,
+                "body": body,
+                "ts": entry.ts,
+            }),
+        );
         Ok(json!({
             "msg-id": msg_id(entry.seq),
             "status": if online { "sent" } else { "queued" },
         }))
+    }
+
+    fn set_downloads_dir(&self, params: Value) -> Result<Value, (i64, String)> {
+        let s = self.session()?;
+        let path = params["path"]
+            .as_str()
+            .filter(|p| !p.is_empty())
+            .ok_or((-32602, "setDownloadsDir needs path".to_string()))?;
+        let path = std::path::PathBuf::from(shellexpand_home(path));
+        std::fs::create_dir_all(&path)
+            .map_err(|e| (-32603, format!("cannot create {}: {e}", path.display())))?;
+        s.shared
+            .store
+            .lock()
+            .unwrap()
+            .meta_set("downloads_dir", &path.to_string_lossy());
+        *s.shared.downloads_dir.lock().unwrap() = path.clone();
+        Ok(json!({"downloads-dir": path.to_string_lossy()}))
+    }
+
+    fn set_file_policy(&self, params: Value) -> Result<Value, (i64, String)> {
+        let s = self.session()?;
+        let default = params["default"].as_str().unwrap_or("");
+        if !matches!(default, "accept" | "reject" | "ask") {
+            return Err((-32602, "default must be accept, reject, or ask".into()));
+        }
+        let store = s.shared.store.lock().unwrap();
+        store.meta_set("files_default", default);
+        Ok(file_policy_json(&store))
+    }
+
+    fn set_contact_file_policy(&self, params: Value) -> Result<Value, (i64, String)> {
+        let s = self.session()?;
+        let id = params["id"]
+            .as_str()
+            .filter(|i| !i.is_empty())
+            .ok_or((-32602, "setContactFilePolicy needs id".to_string()))?;
+        let policy = params["policy"].as_str().unwrap_or("");
+        if !matches!(policy, "accept" | "reject" | "ask" | "default") {
+            return Err((-32602, "policy must be accept, reject, ask, or default".into()));
+        }
+        s.shared
+            .store
+            .lock()
+            .unwrap()
+            .meta_set(&format!("filepol:{id}"), policy);
+        Ok(json!({"id": id, "policy": policy}))
+    }
+
+    fn file_respond(&self, params: Value) -> Result<Value, (i64, String)> {
+        let s = self.session()?;
+        let id = params["id"]
+            .as_str()
+            .ok_or((-32602, "file/respond needs id".to_string()))?;
+        let accept = params["accept"].as_bool().unwrap_or(false);
+        let pending = s.shared.pending_files.lock().unwrap().remove(id);
+        let Some(p) = pending else {
+            return Err((-32602, format!("no pending file {id}")));
+        };
+        if accept {
+            tokio::spawn(crate::blob::received(s.shared.clone(), p.peer, p.hash, p.name));
+        } else {
+            s.shared.notifier.notify(
+                "file/declined",
+                json!({"from": p.peer.id, "from-name": p.peer.name, "name": p.name}),
+            );
+        }
+        Ok(json!({"id": id, "accepted": accept}))
     }
 
     fn msg_history(&self, params: Value) -> Result<Value, (i64, String)> {
@@ -370,21 +468,27 @@ impl Daemon {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| to.to_string());
-        {
+        let (seq, ts) = {
             let store = s.shared.store.lock().unwrap();
             let seq = store.frontier(&s.shared.my_master, &contact.master_pub) + 1;
-            let entry = LogEntry::sign(
-                &s.keys.master,
-                contact.master_pub,
-                seq,
-                "file",
-                &name,
-                now_ts(),
-            );
+            let ts = now_ts();
+            let entry = LogEntry::sign(&s.keys.master, contact.master_pub, seq, "file", &name, ts);
             store.append(&entry);
             store.enqueue(&contact.master_pub, seq);
-        }
+            (seq, ts)
+        };
         ensure_peer(&s.shared, &contact.id).send(PeerCmd::Push).ok();
+        self.notifier.notify(
+            "msg/sent",
+            json!({
+                "id": msg_id(seq),
+                "to": contact.id,
+                "to-name": contact.name,
+                "kind": "file",
+                "body": name,
+                "ts": ts,
+            }),
+        );
         tokio::spawn(crate::blob::send(
             s.shared.clone(),
             contact,
@@ -468,6 +572,16 @@ impl Daemon {
             }
             None => (vec![], json!("unchecked")),
         };
+        let downloads = self
+            .session
+            .as_ref()
+            .map(|s| s.shared.downloads_dir.lock().unwrap().to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let files = self
+            .session
+            .as_ref()
+            .map(|s| file_policy_json(&s.shared.store.lock().unwrap()))
+            .unwrap_or_else(|| json!({"default": "accept"}));
         json!({
             "node-id": self.node_id(),
             "online": true,
@@ -475,6 +589,8 @@ impl Daemon {
             "tor": tor,
             "inbound-direct": inbound,
             "advertised-addrs": self.transport.advertised_addrs,
+            "downloads-dir": downloads,
+            "files": files,
             "contacts": self.contact_list(),
             "queue": queue,
         })
@@ -483,4 +599,21 @@ impl Daemon {
 
 fn whoami() -> String {
     std::env::var("USER").unwrap_or_else(|_| "anon".into())
+}
+
+fn file_policy_json(store: &Store) -> Value {
+    let default = store
+        .meta_get("files_default")
+        .unwrap_or_else(|| "accept".into());
+    json!({ "default": default })
+}
+
+fn shellexpand_home(path: &str) -> String {
+    match path.strip_prefix("~/") {
+        Some(rest) => match std::env::var("HOME") {
+            Ok(home) => format!("{home}/{rest}"),
+            Err(_) => path.to_string(),
+        },
+        None => path.to_string(),
+    }
 }

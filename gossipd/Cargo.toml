@@ -1,6 +1,8 @@
 [workspace]
 resolver = "2"
-members = ["core", "daemon"]
+members = ["core", "daemon", "client", "tui", "bevy"]
+default-members = ["core", "daemon", "client", "tui"]
+exclude = ["core/fuzz"]
 
 [workspace.dependencies]
 serde = { version = "1", features = ["derive"] }

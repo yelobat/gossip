@@ -22,6 +22,7 @@ pub struct Shared {
     pub blobs: iroh_blobs::api::Store,
     pub blobs_proto: iroh_blobs::BlobsProtocol,
     pub data_dir: std::path::PathBuf,
+    pub downloads_dir: Mutex<std::path::PathBuf>,
     pub backoff: BackoffCfg,
     pub my_master: [u8; 32],
 
@@ -30,6 +31,8 @@ pub struct Shared {
     pub conns: Mutex<HashMap<String, iroh::endpoint::Connection>>,
 
     pub inbound_seen: Mutex<bool>,
+
+    pub pending_files: Mutex<HashMap<String, PendingFile>>,
 
     pub tor: Mutex<Option<std::sync::Arc<crate::tor::TorState>>>,
 }
@@ -42,6 +45,34 @@ impl Shared {
     pub fn live_connection(&self, contact_id: &str) -> Option<iroh::endpoint::Connection> {
         self.conns.lock().unwrap().get(contact_id).cloned()
     }
+
+    pub fn file_decision(&self, peer_id: &str) -> FileDecision {
+        let store = self.store.lock().unwrap();
+        let per = store.meta_get(&format!("filepol:{peer_id}"));
+        let policy = match per.as_deref() {
+            Some(p @ ("accept" | "reject" | "ask")) => p.to_string(),
+            _ => store
+                .meta_get("files_default")
+                .unwrap_or_else(|| "accept".into()),
+        };
+        match policy.as_str() {
+            "reject" => FileDecision::Reject,
+            "ask" => FileDecision::Ask,
+            _ => FileDecision::Accept,
+        }
+    }
+}
+
+pub enum FileDecision {
+    Accept,
+    Reject,
+    Ask,
+}
+
+pub struct PendingFile {
+    pub hash: String,
+    pub name: String,
+    pub peer: crate::sync::PeerInfo,
 }
 
 pub fn now_ts() -> f64 {

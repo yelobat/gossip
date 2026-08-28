@@ -1,5 +1,6 @@
 mod blob;
 mod keys;
+mod listen;
 mod net;
 mod peer;
 mod rpc;
@@ -8,28 +9,21 @@ mod store;
 mod sync;
 mod tor;
 
-use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 
-use gossipd_core::frame::{encode_frame, FrameDecoder};
+use gossipd_core::frame::encode_frame;
 use serde_json::{json, Value};
+use tokio::sync::mpsc;
 
 #[derive(Clone)]
-pub struct Notifier(Arc<Mutex<std::io::Stdout>>);
+pub struct ClientHandle {
+    tx: mpsc::UnboundedSender<Arc<Vec<u8>>>,
+}
 
-impl Notifier {
-    fn new() -> Self {
-        Self(Arc::new(Mutex::new(std::io::stdout())))
-    }
-
-    pub fn send(&self, payload: &Value) {
-        let bytes = encode_frame(payload.to_string().as_bytes());
-        let mut out = self.0.lock().unwrap();
-        out.write_all(&bytes).and_then(|_| out.flush()).ok();
-    }
-
-    pub fn notify(&self, method: &str, params: Value) {
-        self.send(&json!({"jsonrpc": "2.0", "method": method, "params": params}));
+impl ClientHandle {
+    fn send(&self, payload: &Value) {
+        let bytes = Arc::new(encode_frame(payload.to_string().as_bytes()));
+        self.tx.send(bytes).ok();
     }
 
     pub fn respond(&self, id: &Value, result: Value) {
@@ -42,35 +36,31 @@ impl Notifier {
     }
 }
 
-fn read_requests(tx: tokio::sync::mpsc::Sender<Value>) {
-    let mut stdin = std::io::stdin().lock();
-    let mut decoder = FrameDecoder::new();
-    let mut chunk = [0u8; 8192];
-    loop {
-        let n = match stdin.read(&mut chunk) {
-            Ok(0) | Err(_) => return,
-            Ok(n) => n,
-        };
-        decoder.feed(&chunk[..n]);
-        loop {
-            match decoder.next_frame() {
-                Ok(Some(body)) => match serde_json::from_slice(&body) {
-                    Ok(request) => {
-                        if tx.blocking_send(request).is_err() {
-                            return;
-                        }
-                    }
-                    Err(err) => tracing::warn!("dropping unparseable frame: {err}"),
-                },
-                Ok(None) => break,
-                Err(err) => {
-                    tracing::error!("framing error: {err}, closing");
-                    return;
-                }
-            }
-        }
+#[derive(Clone, Default)]
+pub struct Notifier {
+    clients: Arc<Mutex<Vec<ClientHandle>>>,
+}
+
+impl Notifier {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn register(&self, handle: ClientHandle) {
+        self.clients.lock().unwrap().push(handle);
+    }
+
+    pub fn notify(&self, method: &str, params: Value) {
+        let payload = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let bytes = Arc::new(encode_frame(payload.to_string().as_bytes()));
+        self.clients
+            .lock()
+            .unwrap()
+            .retain(|c| c.tx.send(bytes.clone()).is_ok());
     }
 }
+
+pub type Requests = mpsc::Sender<(Value, ClientHandle)>;
 
 #[tokio::main]
 async fn main() {
@@ -83,13 +73,18 @@ async fn main() {
         .init();
 
     let notifier = Notifier::new();
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<Value>(64);
-    std::thread::spawn(move || read_requests(tx));
+    let (req_tx, mut req_rx) = mpsc::channel::<(Value, ClientHandle)>(64);
 
-    let mut daemon = rpc::Daemon::new(notifier.clone());
-    tracing::info!("gossipd up");
-    while let Some(request) = rx.recv().await {
-        daemon.handle(request).await;
+    listen::serve_stdio(req_tx.clone(), &notifier);
+    if let Ok(path) = std::env::var("GOSSIPD_CONTROL") {
+        listen::serve_control(path.into(), req_tx.clone(), notifier.clone()).await;
     }
-    tracing::info!("stdin closed, exiting");
+    drop(req_tx);
+
+    let mut daemon = rpc::Daemon::new(notifier);
+    tracing::info!("gossipd up");
+    while let Some((request, origin)) = req_rx.recv().await {
+        daemon.handle(request, &origin).await;
+    }
+    tracing::info!("all clients gone, exiting");
 }

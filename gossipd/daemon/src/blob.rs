@@ -97,7 +97,7 @@ pub async fn received(shared: Arc<Shared>, peer: PeerInfo, hash: String, name: S
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| hash.to_string());
-    let dir = shared.data_dir.join("downloads");
+    let dir = shared.downloads_dir.lock().unwrap().clone();
     if std::fs::create_dir_all(&dir).is_err() {
         return;
     }

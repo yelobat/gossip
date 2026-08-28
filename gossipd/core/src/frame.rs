@@ -35,11 +35,14 @@ impl FrameDecoder {
         };
         let length = content_length(&self.buf[..header_end])?;
         let body_start = header_end + 4;
-        if self.buf.len() < body_start + length {
+        let Some(frame_end) = body_start.checked_add(length) else {
+            return Ok(None);
+        };
+        if self.buf.len() < frame_end {
             return Ok(None);
         }
-        let body = self.buf[body_start..body_start + length].to_vec();
-        self.buf.drain(..body_start + length);
+        let body = self.buf[body_start..frame_end].to_vec();
+        self.buf.drain(..frame_end);
         Ok(Some(body))
     }
 }
@@ -68,6 +71,13 @@ pub fn encode_frame(body: &[u8]) -> Vec<u8> {
     let mut out = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
     out.extend_from_slice(body);
     out
+}
+
+pub fn auth_frame_matches(body: &[u8], token: &str) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body)
+        .ok()
+        .and_then(|v| v.get("auth").and_then(serde_json::Value::as_str).map(|a| a == token))
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
@@ -154,5 +164,49 @@ mod tests {
         let mut d = FrameDecoder::new();
         d.feed(b"Content-Length: banana\r\n\r\n{}");
         assert_eq!(d.next_frame(), Err(FrameError::BadContentLength));
+    }
+
+    #[test]
+    fn huge_content_length_never_panics() {
+        let mut d = FrameDecoder::new();
+        d.feed(format!("Content-Length: {}\r\n\r\nabc", usize::MAX).as_bytes());
+        assert_eq!(d.next_frame().unwrap(), None);
+    }
+
+    #[test]
+    fn auth_frame_matches_only_exact_token() {
+        assert!(auth_frame_matches(br#"{"auth":"secret"}"#, "secret"));
+        assert!(!auth_frame_matches(br#"{"auth":"secret"}"#, "other"));
+        assert!(!auth_frame_matches(br#"{"method":"init"}"#, "secret"));
+        assert!(!auth_frame_matches(b"not json", "secret"));
+    }
+
+    use proptest::prelude::*;
+
+    proptest! {
+        #[test]
+        fn auth_never_panics(body: Vec<u8>, token: String) {
+            let _ = auth_frame_matches(&body, &token);
+        }
+
+        #[test]
+        fn roundtrips_across_any_split(body: Vec<u8>, split in 0.0f64..1.0) {
+            let bytes = encode_frame(&body);
+            let at = (bytes.len() as f64 * split) as usize;
+            let mut d = FrameDecoder::new();
+            d.feed(&bytes[..at]);
+            prop_assert_eq!(d.next_frame().unwrap(), None);
+            d.feed(&bytes[at..]);
+            prop_assert_eq!(d.next_frame().unwrap().unwrap(), body);
+        }
+
+        #[test]
+        fn arbitrary_input_never_panics(chunks: Vec<Vec<u8>>) {
+            let mut d = FrameDecoder::new();
+            for c in &chunks {
+                d.feed(c);
+                while let Ok(Some(_)) = d.next_frame() {}
+            }
+        }
     }
 }

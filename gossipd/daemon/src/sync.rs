@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::json;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
-use crate::state::{msg_id, now_ts, Shared};
+use crate::state::{msg_id, now_ts, FileDecision, Shared};
+
+fn hex_id() -> String {
+    let n = crate::state::random_nonce();
+    format!("{:02x}{:02x}{:02x}{:02x}", n[0], n[1], n[2], n[3])
+}
 
 #[derive(Serialize, Deserialize)]
 #[serde(tag = "t", rename_all = "lowercase")]
@@ -99,9 +104,32 @@ where
             let upto = receive_entries(shared, peer, recv).await;
             write_msg(send, &WireMsg::Ack { upto }).await.ok();
         }
-        Some(WireMsg::Blob { hash, name, .. }) => {
-            crate::blob::received(shared.clone(), peer.clone(), hash, name).await;
-
+        Some(WireMsg::Blob { hash, name, size }) => {
+            match shared.file_decision(&peer.id) {
+                FileDecision::Accept => {
+                    crate::blob::received(shared.clone(), peer.clone(), hash, name).await
+                }
+                FileDecision::Reject => shared.notifier.notify(
+                    "file/declined",
+                    json!({"from": peer.id, "from-name": peer.name, "name": name}),
+                ),
+                FileDecision::Ask => {
+                    let id = format!("f{}", hex_id());
+                    shared.pending_files.lock().unwrap().insert(
+                        id.clone(),
+                        crate::state::PendingFile {
+                            hash,
+                            name: name.clone(),
+                            peer: peer.clone(),
+                        },
+                    );
+                    shared.notifier.notify(
+                        "file/incoming",
+                        json!({"id": id, "from": peer.id, "from-name": peer.name,
+                               "name": name, "size": size}),
+                    );
+                }
+            }
             write_msg(send, &WireMsg::End).await.ok();
         }
         _ => {}

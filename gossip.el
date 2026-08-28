@@ -127,29 +127,69 @@
         gossip--node-id nil)
   (message "gossip: daemon stopped"))
 
+(defun gossip--control-file ()
+  "Path to this profile's daemon control file (loopback port + token)."
+  (expand-file-name "gossip.port" (expand-file-name gossip-data-directory)))
+
+(defun gossip--read-control (file)
+  "Return (PORT . TOKEN) parsed from control FILE, or nil if unreadable."
+  (ignore-errors
+    (with-temp-buffer
+      (insert-file-contents file)
+      (let ((lines (split-string (buffer-string) "\n" t)))
+        (when (>= (length lines) 2)
+          (cons (string-to-number (car lines)) (string-trim (nth 1 lines))))))))
+
+(defun gossip--send-auth (process token)
+  "Send the framed control-port auth message carrying TOKEN to PROCESS.
+TOKEN is daemon-generated lowercase hex, so no JSON escaping is needed."
+  (let ((body (format "{\"auth\":\"%s\"}" token)))
+    (process-send-string
+     process
+     (format "Content-Length: %d\r\n\r\n%s" (string-bytes body) body))))
+
+(defun gossip--daemon-process ()
+  "Return a process talking to gossipd.
+Attach to a daemon already listening on the profile control port if
+there is one, otherwise spawn a daemon that also listens on it so a
+terminal or Bevy client can attach to the same identity."
+  (let* ((control (gossip--control-file))
+         (info (and (file-exists-p control) (gossip--read-control control)))
+         (process
+          (and info
+               (ignore-errors
+                 (let ((proc (make-network-process
+                              :name "gossipd" :host "127.0.0.1"
+                              :service (car info)
+                              :coding 'utf-8-emacs-unix :noquery t)))
+                   (gossip--send-auth proc (cdr info))
+                   proc)))))
+    (or process
+        (let* ((stderr-buffer (get-buffer-create " *gossipd stderr*"))
+               (process-environment
+                (append (list (concat "GOSSIPD_CONTROL=" control))
+                        (and gossip-bind-address
+                             (list (concat "GOSSIPD_BIND=" gossip-bind-address)))
+                        process-environment))
+               (proc (make-process
+                      :name "gossipd"
+                      :command gossip-daemon-command
+                      :connection-type 'pipe
+                      :coding 'utf-8-emacs-unix
+                      :noquery t
+                      :stderr stderr-buffer)))
+          (when-let* ((stderr-process (get-buffer-process stderr-buffer)))
+            (set-process-query-on-exit-flag stderr-process nil))
+          proc))))
+
 (defun gossip--make-connection ()
-  "Spawn gossipd and return a connection to it."
-  (let* ((stderr-buffer (get-buffer-create " *gossipd stderr*"))
-         (process-environment
-          (if gossip-bind-address
-              (cons (concat "GOSSIPD_BIND=" gossip-bind-address)
-                    process-environment)
-            process-environment))
-         (process (make-process
-                   :name "gossipd"
-                   :command gossip-daemon-command
-                   :connection-type 'pipe
-                   :coding 'utf-8-emacs-unix
-                   :noquery t
-                   :stderr stderr-buffer)))
-    (when-let* ((stderr-process (get-buffer-process stderr-buffer)))
-      (set-process-query-on-exit-flag stderr-process nil))
-    (make-instance 'jsonrpc-process-connection
-                   :name "gossip"
-                   :process process
-                   :notification-dispatcher #'gossip--dispatch-notification
-                   :request-dispatcher #'gossip--dispatch-request
-                   :on-shutdown #'gossip--on-shutdown)))
+  "Return a jsonrpc connection to gossipd, sharing a running daemon if any."
+  (make-instance 'jsonrpc-process-connection
+                 :name "gossip"
+                 :process (gossip--daemon-process)
+                 :notification-dispatcher #'gossip--dispatch-notification
+                 :request-dispatcher #'gossip--dispatch-request
+                 :on-shutdown #'gossip--on-shutdown))
 
 ;;;###autoload
 (defun gossip-daemon-start ()
@@ -255,6 +295,9 @@
   "Route daemon notification METHOD with PARAMS."
   (pcase method
     ('msg/received (gossip--handle-incoming params))
+    ('msg/sent (gossip--handle-sent params))
+    ('file/incoming (run-at-time 0 nil #'gossip--prompt-file params))
+    ('file/declined (gossip--handle-file-declined params))
     ('msg/delivered
      (run-hook-with-args 'gossip-delivery-functions params)
      (gossip--chat-system (plist-get params :to)
@@ -301,6 +344,14 @@
      (handler (funcall handler msg))
      (t (message "gossip: message of unregistered kind %S from %s"
                  kind (plist-get msg :from-name))))))
+
+(defun gossip--handle-sent (msg)
+  "Render an outgoing MSG (from any client on this identity) into its buffer."
+  (let* ((peer-id (plist-get msg :to))
+         (peer-name (or (plist-get msg :to-name) peer-id))
+         (buffer (gossip--chat-buffer peer-id peer-name)))
+    (gossip--chat-append buffer "you" (gossip--chat-body msg)
+                         'gossip-self-face (plist-get msg :ts))))
 
 (defvar-local gossip--chat-peer-id nil)
 (defvar-local gossip--chat-peer-name nil)
@@ -418,9 +469,7 @@
                       (format "To %s: " gossip--chat-peer-name))))
   (unless (derived-mode-p 'gossip-chat-mode)
     (user-error "Not a gossip chat buffer"))
-  (let ((buffer (current-buffer))
-        (peer-id gossip--chat-peer-id))
-    (gossip--chat-append buffer "you" text 'gossip-self-face)
+  (let ((peer-id gossip--chat-peer-id))
     (gossip-send peer-id text
                  :on-result
                  (lambda (reply)
@@ -447,14 +496,69 @@
     (gossip--request 'blob/send
                      (list :to (plist-get contact :id)
                            :path (expand-file-name file)))
-    (when-let* ((buffer (gethash (plist-get contact :id) gossip--chat-buffers)))
-      (when (buffer-live-p buffer)
-        (gossip--chat-append
-         buffer "you"
-         (format "[file] %s" (file-name-nondirectory file))
-         'gossip-self-face)))
     (message "gossip: transferring %s to %s"
              (file-name-nondirectory file) (plist-get contact :name))))
+
+;;;###autoload
+(defun gossip-downloads-directory ()
+  "Show where received files are saved."
+  (interactive)
+  (message "gossip: received files are saved to %s"
+           (plist-get (gossip--request 'status) :downloads-dir)))
+
+;;;###autoload
+(defun gossip-set-downloads-directory (dir)
+  "Set DIR as the folder where received files are saved."
+  (interactive "DSave received files to: ")
+  (message "gossip: received files now saved to %s"
+           (plist-get (gossip--request 'config/setDownloadsDir
+                                       (list :path (expand-file-name dir)))
+                      :downloads-dir)))
+
+(defun gossip--handle-file-declined (params)
+  "Note in PARAMS's chat buffer that an offered file was declined."
+  (let ((name (plist-get params :name)))
+    (gossip--chat-system (plist-get params :from) (format "declined file %s" name))
+    (message "gossip: declined file %s from %s" name (plist-get params :from-name))))
+
+(defun gossip--prompt-file (params)
+  "Ask whether to accept the offered file described by PARAMS."
+  (let ((accept (yes-or-no-p
+                 (format "gossip: accept file %s (%s bytes) from %s? "
+                         (plist-get params :name)
+                         (plist-get params :size)
+                         (plist-get params :from-name)))))
+    (gossip--request 'file/respond
+                     (list :id (plist-get params :id)
+                           :accept (if accept t :json-false)))
+    (message "gossip: %s %s"
+             (if accept "accepted" "declined") (plist-get params :name))))
+
+;;;###autoload
+(defun gossip-file-policy ()
+  "Show the current default policy for incoming files."
+  (interactive)
+  (message "gossip: incoming files default=%s"
+           (plist-get (plist-get (gossip--request 'status) :files) :default)))
+
+;;;###autoload
+(defun gossip-set-file-policy (policy)
+  "Set the default POLICY for incoming files: accept, reject, or ask."
+  (interactive (list (completing-read "Default for incoming files: "
+                                      '("accept" "reject" "ask") nil t)))
+  (gossip--request 'config/setFilePolicy (list :default policy))
+  (message "gossip: incoming files default=%s" policy))
+
+;;;###autoload
+(defun gossip-set-contact-file-policy (contact policy)
+  "Set file POLICY (accept, reject, ask, or default) for CONTACT."
+  (interactive
+   (list (gossip--read-contact)
+         (completing-read "Files from this contact: "
+                          '("accept" "reject" "ask" "default") nil t)))
+  (gossip--request 'config/setContactFilePolicy
+                   (list :id (plist-get contact :id) :policy policy))
+  (message "gossip: files from %s: %s" (plist-get contact :name) policy))
 
 (defun gossip-show-node-id ()
   "Show and copy this node's id."
