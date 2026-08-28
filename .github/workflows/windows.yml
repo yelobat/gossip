@@ -1,0 +1,30 @@
+name: windows
+
+on:
+  push:
+    branches: [master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: gossipd
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gossipd
+      - name: Build daemon + TUI (release)
+        run: cargo build --release -p gossipd -p gossip-tui
+      - name: Test core + client + tui
+        run: cargo test -p gossipd-core -p gossip-client -p gossip-tui
+      - name: Upload binaries
+        uses: actions/upload-artifact@v4
+        with:
+          name: gossip-windows-x86_64
+          path: |
+            gossipd/target/release/gossipd.exe
+            gossipd/target/release/gossip.exe
