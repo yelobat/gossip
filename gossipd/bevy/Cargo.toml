@@ -1,0 +1,13 @@
+[package]
+name = "gossip-bevy"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+gossip-client = { path = "../client" }
+bevy_app = "0.19"
+bevy_ecs = "0.19"
+
+[dev-dependencies]
+# Full umbrella (headless: no render/winit) so the example gets MinimalPlugins.
+bevy = { version = "0.19", default-features = false }

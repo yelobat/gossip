@@ -1,0 +1,13 @@
+[package]
+name = "gossip-tui"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "gossip"
+path = "src/main.rs"
+
+[dependencies]
+gossip-client = { path = "../client" }
+serde_json.workspace = true
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
