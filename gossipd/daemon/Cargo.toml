@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-gossipd-core = { path = "../core" }
+gossipd-core = { path = "../core", features = ["doc"] }
 serde.workspace = true
 serde_json.workspace = true
 rusqlite = { version = "0.39", features = ["bundled"] }
@@ -29,5 +29,6 @@ tor-rtcompat = "0.45"
 safelog = "0.9.1"
 
 [dev-dependencies]
+proptest = "1"
 serde_json.workspace = true
 gossipd-core = { path = "../core" }

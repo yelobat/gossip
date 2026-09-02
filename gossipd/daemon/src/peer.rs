@@ -154,7 +154,7 @@ async fn run(shared: Arc<Shared>, contact_id: String, mut rx: mpsc::UnboundedRec
 
                     Some(DialOutcome::Tor) => {
                         attempts = 0;
-                        if has_queue(&shared, &contact_id) {
+                        if has_messages(&shared, &contact_id) {
                             let delay = shared.backoff.delay_seconds(0, jitter_roll());
                             next_dial = Some(Instant::now() + Duration::from_secs_f64(delay));
                         }
@@ -176,18 +176,21 @@ fn backoff_or_give_up(
     next_dial: &mut Option<Instant>,
 ) {
     let queued = queued_rows(shared, contact_id);
-    if queued.1.is_empty() {
+    let shares_doc = crate::docs::shares_doc_with(shared, contact_id);
+    if queued.1.is_empty() && !shares_doc {
         return;
     }
     let delay = shared.backoff.delay_seconds(*attempts, jitter_roll());
     *attempts += 1;
     let (name, master) = queued.0;
-    shared
-        .store
-        .lock()
-        .unwrap()
-        .queue_set_attempt(&master, *attempts, now_ts() + delay);
-    if shared.backoff.gave_up(*attempts) {
+    if !queued.1.is_empty() {
+        shared
+            .store
+            .lock()
+            .unwrap()
+            .queue_set_attempt(&master, *attempts, now_ts() + delay);
+    }
+    if !shares_doc && shared.backoff.gave_up(*attempts) {
         give_up(shared, contact_id, *attempts);
         return;
     }
@@ -224,7 +227,7 @@ fn give_up(shared: &Arc<Shared>, contact_id: &str, attempts: u32) {
     );
 }
 
-fn peer_info(shared: &Arc<Shared>, contact_id: &str) -> Option<PeerInfo> {
+pub fn peer_info(shared: &Arc<Shared>, contact_id: &str) -> Option<PeerInfo> {
     let store = shared.store.lock().unwrap();
     store.contact(contact_id).map(|c| PeerInfo {
         id: c.id,
@@ -234,6 +237,10 @@ fn peer_info(shared: &Arc<Shared>, contact_id: &str) -> Option<PeerInfo> {
 }
 
 fn has_queue(shared: &Arc<Shared>, contact_id: &str) -> bool {
+    has_messages(shared, contact_id) || crate::docs::shares_doc_with(shared, contact_id)
+}
+
+fn has_messages(shared: &Arc<Shared>, contact_id: &str) -> bool {
     !queued_rows(shared, contact_id).1.is_empty()
 }
 
@@ -334,6 +341,7 @@ fn adopt(
         );
     }
     let driver = tokio::spawn(drive(shared.clone(), peer, conn.clone()));
+    crate::docs::open_links(shared, contact_id);
     *link = Some(Link {
         conn,
         outbound,

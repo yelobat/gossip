@@ -35,6 +35,8 @@ pub struct Shared {
     pub pending_files: Mutex<HashMap<String, PendingFile>>,
 
     pub tor: Mutex<Option<std::sync::Arc<crate::tor::TorState>>>,
+
+    pub docs: Mutex<crate::docs::Docs>,
 }
 
 impl Shared {

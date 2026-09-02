@@ -21,6 +21,13 @@ pub struct QueueRow {
     pub next_at: f64,
 }
 
+pub struct DocRow {
+    pub id: String,
+    pub name: String,
+    pub state: String,
+    pub inviter: Option<String>,
+}
+
 pub struct Store {
     conn: Connection,
 }
@@ -53,7 +60,18 @@ impl Store {
                seq INTEGER NOT NULL,
                attempts INTEGER NOT NULL DEFAULT 0,
                next_at REAL NOT NULL DEFAULT 0,
-               PRIMARY KEY(recipient, seq));",
+               PRIMARY KEY(recipient, seq));
+             CREATE TABLE IF NOT EXISTS docs(
+               id TEXT PRIMARY KEY,
+               name TEXT NOT NULL,
+               state TEXT NOT NULL,
+               inviter TEXT,
+               snapshot BLOB);
+             CREATE TABLE IF NOT EXISTS doc_updates(
+               seq INTEGER PRIMARY KEY AUTOINCREMENT,
+               doc_id TEXT NOT NULL,
+               bytes BLOB NOT NULL);
+             CREATE INDEX IF NOT EXISTS doc_updates_doc ON doc_updates(doc_id);",
         )?;
 
         let _ = conn.execute("ALTER TABLE contacts ADD COLUMN onion TEXT", []);
@@ -271,6 +289,106 @@ impl Store {
     }
 }
 
+impl Store {
+    pub fn doc_upsert(&self, id: &str, name: &str, state: &str, inviter: Option<&str>) {
+        self.conn
+            .execute(
+                "INSERT INTO docs(id,name,state,inviter) VALUES(?1,?2,?3,?4)
+                 ON CONFLICT(id) DO UPDATE SET name=excluded.name, state=excluded.state,
+                   inviter=COALESCE(excluded.inviter, docs.inviter)",
+                params![id, name, state, inviter],
+            )
+            .expect("doc write");
+    }
+
+    pub fn docs(&self) -> Vec<DocRow> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT id,name,state,inviter FROM docs ORDER BY name")
+            .expect("docs query");
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(DocRow {
+                    id: r.get(0)?,
+                    name: r.get(1)?,
+                    state: r.get(2)?,
+                    inviter: r.get(3)?,
+                })
+            })
+            .expect("docs rows");
+        rows.filter_map(Result::ok).collect()
+    }
+
+    pub fn doc(&self, id: &str) -> Option<DocRow> {
+        self.docs().into_iter().find(|d| d.id == id)
+    }
+
+    pub fn doc_delete(&self, id: &str) {
+        self.conn
+            .execute("DELETE FROM doc_updates WHERE doc_id=?1", [id])
+            .expect("doc updates delete");
+        self.conn
+            .execute("DELETE FROM docs WHERE id=?1", [id])
+            .expect("doc delete");
+    }
+
+    pub fn doc_append(&self, id: &str, bytes: &[u8]) {
+        self.conn
+            .execute(
+                "INSERT INTO doc_updates(doc_id,bytes) VALUES(?1,?2)",
+                params![id, bytes],
+            )
+            .expect("doc append");
+    }
+
+    pub fn doc_update_count(&self, id: &str) -> u64 {
+        self.conn
+            .query_row(
+                "SELECT COUNT(*) FROM doc_updates WHERE doc_id=?1",
+                [id],
+                |r| r.get::<_, i64>(0),
+            )
+            .unwrap_or(0) as u64
+    }
+
+    pub fn doc_snapshot(&self, id: &str, snapshot: &[u8]) {
+        self.conn
+            .execute_batch("BEGIN")
+            .and_then(|_| {
+                self.conn.execute(
+                    "UPDATE docs SET snapshot=?2 WHERE id=?1",
+                    params![id, snapshot],
+                )?;
+                self.conn
+                    .execute("DELETE FROM doc_updates WHERE doc_id=?1", [id])?;
+                self.conn.execute_batch("COMMIT")
+            })
+            .expect("doc snapshot");
+    }
+
+    pub fn doc_state(&self, id: &str) -> (Option<Vec<u8>>, Vec<Vec<u8>>) {
+        let snapshot = self
+            .conn
+            .query_row("SELECT snapshot FROM docs WHERE id=?1", [id], |r| {
+                r.get::<_, Option<Vec<u8>>>(0)
+            })
+            .optional()
+            .ok()
+            .flatten()
+            .flatten();
+        let mut stmt = self
+            .conn
+            .prepare("SELECT bytes FROM doc_updates WHERE doc_id=?1 ORDER BY seq")
+            .expect("doc updates query");
+        let updates = stmt
+            .query_map([id], |r| r.get::<_, Vec<u8>>(0))
+            .expect("doc updates rows")
+            .filter_map(Result::ok)
+            .collect();
+        (snapshot, updates)
+    }
+}
+
 fn row_to_entry(r: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntry> {
     Ok(LogEntry {
         author: r.get::<_, Vec<u8>>(0)?.try_into().unwrap_or([0; 32]),
@@ -320,6 +438,24 @@ mod tests {
         assert_eq!(s.queued().len(), 3);
         assert_eq!(s.dequeue_up_to(&peer, 2), vec![1, 2]);
         assert_eq!(s.queued().len(), 1);
+    }
+
+    #[test]
+    fn doc_log_snapshot_and_delete() {
+        let s = store();
+        s.doc_upsert("d1", "notes", "invited", Some("gsp1-x"));
+        s.doc_upsert("d1", "notes", "active", None);
+        let row = s.doc("d1").unwrap();
+        assert_eq!((row.state.as_str(), row.inviter.as_deref()), ("active", Some("gsp1-x")));
+        s.doc_append("d1", b"u1");
+        s.doc_append("d1", b"u2");
+        assert_eq!(s.doc_update_count("d1"), 2);
+        assert_eq!(s.doc_state("d1"), (None, vec![b"u1".to_vec(), b"u2".to_vec()]));
+        s.doc_snapshot("d1", b"snap");
+        assert_eq!(s.doc_state("d1"), (Some(b"snap".to_vec()), vec![]));
+        s.doc_delete("d1");
+        assert!(s.doc("d1").is_none());
+        assert_eq!(s.doc_state("d1"), (None, vec![]));
     }
 }
 

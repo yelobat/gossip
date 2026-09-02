@@ -6,7 +6,11 @@ edition = "2021"
 [dev-dependencies]
 proptest = "1"
 
+[features]
+doc = ["dep:yrs"]
+
 [dependencies]
+yrs = { version = "0.27", optional = true }
 serde.workspace = true
 serde_json.workspace = true
 postcard.workspace = true

@@ -31,8 +31,12 @@ fn drain_frames<F: FnMut(Value) -> bool>(decoder: &mut FrameDecoder, mut on_requ
 }
 
 fn make_handle(notifier: &Notifier) -> (ClientHandle, mpsc::UnboundedReceiver<Arc<Vec<u8>>>) {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
     let (tx, rx) = mpsc::unbounded_channel();
-    let handle = ClientHandle { tx };
+    let handle = ClientHandle {
+        id: NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        tx,
+    };
     notifier.register(handle.clone());
     (handle, rx)
 }
@@ -55,7 +59,7 @@ pub fn serve_stdio(requests: Requests, notifier: &Notifier) {
         let mut chunk = [0u8; 8192];
         loop {
             let n = match stdin.read(&mut chunk) {
-                Ok(0) | Err(_) => return,
+                Ok(0) | Err(_) => break,
                 Ok(n) => n,
             };
             decoder.feed(&chunk[..n]);
@@ -63,9 +67,11 @@ pub fn serve_stdio(requests: Requests, notifier: &Notifier) {
                 requests.blocking_send((req, handle.clone())).is_ok()
             });
             if !alive {
-                return;
+                break;
             }
         }
+        let gone = serde_json::json!({"jsonrpc": "2.0", "method": "client/gone"});
+        requests.blocking_send((gone, handle)).ok();
     });
 }
 
@@ -142,14 +148,16 @@ async fn serve_conn(stream: TcpStream, requests: Requests, notifier: Notifier, t
             }
         }
         if !alive {
-            return;
+            break;
         }
         let n = match read.read(&mut chunk).await {
-            Ok(0) | Err(_) => return,
+            Ok(0) | Err(_) => break,
             Ok(n) => n,
         };
         decoder.feed(&chunk[..n]);
     }
+    let gone = serde_json::json!({"jsonrpc": "2.0", "method": "client/gone"});
+    requests.send((gone, handle)).await.ok();
 }
 
 async fn authenticate<R>(read: &mut R, decoder: &mut FrameDecoder, token: &str) -> bool

@@ -13,9 +13,11 @@ fn hex_id() -> String {
     format!("{:02x}{:02x}{:02x}{:02x}", n[0], n[1], n[2], n[3])
 }
 
-#[derive(Serialize, Deserialize)]
+const MAX_LINE: usize = 64 * 1024 * 1024;
+
+#[derive(Serialize, Deserialize, Clone)]
 #[serde(tag = "t", rename_all = "lowercase")]
-enum WireMsg {
+pub enum WireMsg {
     Pull {
         frontier: u64,
     },
@@ -33,6 +35,22 @@ enum WireMsg {
         name: String,
         size: u64,
     },
+
+    Doc {
+        id: String,
+    },
+
+    Sv {
+        b: String,
+    },
+
+    Up {
+        b: String,
+    },
+
+    Cur {
+        b: String,
+    },
 }
 
 #[derive(Clone)]
@@ -42,25 +60,39 @@ pub struct PeerInfo {
     pub master: [u8; 32],
 }
 
-async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &WireMsg) -> std::io::Result<()> {
+pub async fn write_msg<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &WireMsg) -> std::io::Result<()> {
     let mut line = serde_json::to_vec(msg).expect("wire msg encodes");
     line.push(b'\n');
     w.write_all(&line).await
 }
 
-async fn read_msg<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Option<WireMsg> {
-    let mut line = String::new();
-    match r.read_line(&mut line).await {
-        Ok(0) | Err(_) => None,
-        Ok(_) => {
-            let parsed = serde_json::from_str(&line).ok();
-            if parsed.is_none() {
-                tracing::warn!("unparseable wire line: {line:?}");
-            }
-            tracing::trace!("wire <- {line:?}");
-            parsed
+pub async fn read_msg<R: AsyncBufReadExt + Unpin>(r: &mut R) -> Option<WireMsg> {
+    let mut line = Vec::new();
+    loop {
+        let buf = r.fill_buf().await.ok()?;
+        if buf.is_empty() {
+            return None;
+        }
+        let (chunk, done) = match buf.iter().position(|&b| b == b'\n') {
+            Some(i) => (&buf[..i], true),
+            None => (buf, false),
+        };
+        if line.len() + chunk.len() > MAX_LINE {
+            tracing::warn!("wire line over {MAX_LINE} bytes, dropping stream");
+            return None;
+        }
+        line.extend_from_slice(chunk);
+        let used = chunk.len() + usize::from(done);
+        r.consume(used);
+        if done {
+            break;
         }
     }
+    let parsed = serde_json::from_slice(&line).ok();
+    if parsed.is_none() {
+        tracing::warn!("unparseable wire line ({} bytes)", line.len());
+    }
+    parsed
 }
 
 pub async fn serve_stream(
@@ -71,7 +103,11 @@ pub async fn serve_stream(
 ) {
     let mut send = send;
     let mut recv = BufReader::new(recv);
-    serve_inner(shared, peer, &mut send, &mut recv).await;
+    let first = read_msg(&mut recv).await;
+    if let Some(WireMsg::Doc { id }) = first {
+        return crate::docs::serve_inbound(shared, peer, &id, send, recv).await;
+    }
+    serve_first(shared, peer, first, &mut send, &mut recv).await;
     send.finish().ok();
 
     let _ = send.stopped().await;
@@ -82,7 +118,21 @@ where
     W: AsyncWriteExt + Unpin,
     R: AsyncBufReadExt + Unpin,
 {
-    match read_msg(recv).await {
+    let first = read_msg(recv).await;
+    serve_first(shared, peer, first, send, recv).await;
+}
+
+async fn serve_first<W, R>(
+    shared: &Arc<Shared>,
+    peer: &PeerInfo,
+    first: Option<WireMsg>,
+    send: &mut W,
+    recv: &mut R,
+) where
+    W: AsyncWriteExt + Unpin,
+    R: AsyncBufReadExt + Unpin,
+{
+    match first {
         Some(WireMsg::Pull { frontier }) => {
             let entries = {
                 let store = shared.store.lock().unwrap();
@@ -290,6 +340,9 @@ async fn receive_entries<R: AsyncBufReadExt + Unpin>(
                 }
                 let fresh = shared.store.lock().unwrap().append(&entry);
                 if fresh {
+                    if entry.kind == crate::docs::KIND_INVITE {
+                        crate::docs::on_invite(shared, peer, &entry.body);
+                    }
                     shared.notifier.notify(
                         "msg/received",
                         json!({

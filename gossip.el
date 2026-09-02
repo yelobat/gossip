@@ -121,6 +121,9 @@
 (defvar gossip-tor-status-functions nil
   "Message hook run with a plist on tor bootstrap progress.")
 
+(defvar gossip-notification-functions nil
+  "Hook run with METHOD and PARAMS for every daemon notification.")
+
 (defun gossip--live-p ()
   "Return non-nil if the daemon connection is usable."
   (and gossip--connection (jsonrpc-running-p gossip--connection)))
@@ -298,6 +301,11 @@ terminal or Bevy client can attach to the same identity."
 
 (defun gossip--dispatch-notification (_conn method params)
   "Route daemon notification METHOD with PARAMS."
+  (unless (run-hook-with-args-until-success 'gossip-notification-functions method params)
+    (gossip--dispatch-builtin method params)))
+
+(defun gossip--dispatch-builtin (method params)
+  "Handle the built-in daemon notification METHOD with PARAMS."
   (pcase method
     ('msg/received (gossip--handle-incoming params))
     ('msg/sent (gossip--handle-sent params))

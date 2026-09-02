@@ -117,6 +117,29 @@ impl Daemon {
             "profile/export" => self.profile_export(params),
             "profile/import" => self.profile_import(params),
             "net/check" => self.net_check(),
+            "peer/disconnect" => {
+                let s = self.session()?;
+                let id = params["id"].as_str().unwrap_or("");
+                let had = s.shared.live_connection(id).map(|c| c.close(0u32.into(), b"disconnect"));
+                Ok(json!({"id": id, "disconnected": had.is_some()}))
+            }
+            "doc/create" => {
+                let s = self.session()?;
+                crate::docs::rpc_create(&s.shared, &params, &self.display_name)
+            }
+            "doc/invite" => self.doc_invite(params),
+            "doc/list" => Ok(crate::docs::rpc_list(&self.session()?.shared)),
+            "doc/join" => crate::docs::rpc_join(&self.session()?.shared, &params),
+            "doc/leave" => crate::docs::rpc_leave(&self.session()?.shared, &params),
+            "doc/attach" => crate::docs::rpc_attach(&self.session()?.shared, &params, origin.id()),
+            "doc/detach" => crate::docs::rpc_detach(&self.session()?.shared, &params, origin.id()),
+            "doc/sync" => crate::docs::rpc_sync(&self.session()?.shared, &params, origin.id()),
+            "client/gone" => {
+                if let Some(s) = &self.session {
+                    crate::docs::client_gone(&s.shared, origin.id());
+                }
+                Ok(json!({"ok": true}))
+            }
             "status" => Ok(self.status()),
             "shutdown" => {
                 origin.respond(id, json!({"ok": true}));
@@ -217,6 +240,7 @@ impl Daemon {
             inbound_seen: Mutex::new(false),
             pending_files: Mutex::new(Default::default()),
             tor: Mutex::new(None),
+            docs: Mutex::new(Default::default()),
         });
         net::spawn_accept_loop(shared.clone());
         if let Some(mdns) = mdns {
@@ -236,6 +260,7 @@ impl Daemon {
             );
         }
 
+        crate::docs::load_all(&shared);
         for contact in shared.store.lock().unwrap().contacts() {
             ensure_peer(&shared, &contact.id);
         }
@@ -350,6 +375,16 @@ impl Daemon {
             "msg-id": msg_id(entry.seq),
             "status": if online { "sent" } else { "queued" },
         }))
+    }
+
+    fn doc_invite(&mut self, params: Value) -> Result<Value, (i64, String)> {
+        let id = params["id"].as_str().unwrap_or("").to_string();
+        let invited = crate::docs::rpc_invite(&self.session()?.shared, &params)?;
+        for (to, name) in &invited {
+            let body = json!({"id": id, "name": name}).to_string();
+            self.msg_send(json!({"to": to, "kind": crate::docs::KIND_INVITE, "body": body}))?;
+        }
+        Ok(json!({"id": id, "invited": invited.iter().map(|(to, _)| to).collect::<Vec<_>>()}))
     }
 
     fn set_downloads_dir(&self, params: Value) -> Result<Value, (i64, String)> {

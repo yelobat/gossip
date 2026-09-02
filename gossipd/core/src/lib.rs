@@ -5,3 +5,5 @@ pub mod log;
 pub mod profile;
 pub mod ticket;
 pub mod torauth;
+#[cfg(feature = "doc")]
+pub mod doc;

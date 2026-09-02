@@ -1,4 +1,5 @@
 mod blob;
+mod docs;
 mod keys;
 mod listen;
 mod net;
@@ -17,10 +18,15 @@ use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct ClientHandle {
+    id: u64,
     tx: mpsc::UnboundedSender<Arc<Vec<u8>>>,
 }
 
 impl ClientHandle {
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
     fn send(&self, payload: &Value) {
         let bytes = Arc::new(encode_frame(payload.to_string().as_bytes()));
         self.tx.send(bytes).ok();
@@ -57,6 +63,16 @@ impl Notifier {
             .lock()
             .unwrap()
             .retain(|c| c.tx.send(bytes.clone()).is_ok());
+    }
+
+    pub fn notify_client(&self, id: u64, method: &str, params: Value) {
+        let payload = json!({"jsonrpc": "2.0", "method": method, "params": params});
+        let bytes = Arc::new(encode_frame(payload.to_string().as_bytes()));
+        for c in self.clients.lock().unwrap().iter() {
+            if c.id == id {
+                c.tx.send(bytes.clone()).ok();
+            }
+        }
     }
 }
 
